@@ -1,5 +1,6 @@
--- LocalScript: Invisibility Cloak (улучшенный GUI + анимации + anti-fling + anti-void)
--- Положить в StarterPlayerScripts
+-- LocalScript: Invisibility Cloak GUI + Phantom animation (скрипт для StarterPlayerScripts)
+-- Основа взята из оригинального Invisible.lua (клонирование персонажа). 
+-- Анимации и часть логики анимаций заимствованы/адаптированы из Animate.lua (gist). 
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -8,7 +9,6 @@ local SoundService = game:GetService("SoundService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
-local workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
 
@@ -19,27 +19,14 @@ local FakeCharacter = nil
 -- Соединения
 local renderConn, realDiedConn, fakeDiedConn, charAddedConn = nil, nil, nil, nil
 
--- Анимационные данные
+-- Анимационные соединения/треки для клона (чтобы потом корректно очистить)
 local FakeAnimData = {
     connections = {},
     tracks = {},
     current = nil,
 }
 
--- Anti-fling/anti-void state
-local antiFlingEnabled = false
-local antiFlingConn = nil
-local antiFlingDescAddedConn = nil
-local affectedParts = {}
-
--- last safe position (CFrame) to teleport back if phantom is in void
-local lastSafeCFrame = nil
--- порог пустоты: используем FallenPartsDestroyHeight если доступен, иначе -500
-local voidY = workspace.FallenPartsDestroyHeight or -500
-local safeYOffset = 10 -- margin above voidY to consider "safe"
-local safeYThreshold = voidY + safeYOffset
-
--- Сохранение позиции UI (опционально для exploit сред)
+-- Хранилище позиции кнопки (локально)
 local savedPosFile = "buttonPos_" .. player.UserId .. ".json"
 local savedPos = nil
 pcall(function()
@@ -48,17 +35,20 @@ pcall(function()
     end
 end)
 
--- ======== Вспомогательные функции ========
+-- Поиск Humanoid
 local function findHumanoid(char)
     if not char then return nil end
     return char:FindFirstChildOfClass("Humanoid")
 end
 
+-- Обновление ссылки на персонажа
 local function updateCharacter()
     RealCharacter = player.Character or player.CharacterAdded:Wait()
 end
 
--- ======== АНИМАЦИИ (адаптация Animate.lua) ========
+-- ========== АНИМАЦИОННАЯ СИСТЕМА (упрощённая адаптация Animate.lua) ==========
+
+-- Таблица стандартных анимаций (взято из Animate.lua gist)
 local animNames = {
     idle = {
         { id = "http://www.roblox.com/asset/?id=507766666", weight = 1 },
@@ -128,6 +118,7 @@ local animNames = {
 }
 
 local function rollAnimation(animList)
+    -- простая рулетка по весам
     if not animList then return 1 end
     local total = 0
     for i = 1, #animList do total = total + (animList[i].weight or 1) end
@@ -144,6 +135,7 @@ local function rollAnimation(animList)
 end
 
 local function AttachAnimateToCharacter(char, storage)
+    -- storage: таблица для хранения connections и tracks (чтобы можно было очистить)
     local humanoid = findHumanoid(char)
     if not humanoid then return end
 
@@ -154,6 +146,7 @@ local function AttachAnimateToCharacter(char, storage)
     storage.runTrack = nil
     storage.animTable = {}
 
+    -- подготовим animTable: для каждого имени создаём Animation объекты (по дефолту из animNames)
     for name, list in pairs(animNames) do
         storage.animTable[name] = {}
         for i = 1, #list do
@@ -161,6 +154,7 @@ local function AttachAnimateToCharacter(char, storage)
             animInst.Name = name
             animInst.AnimationId = list[i].id
             table.insert(storage.animTable[name], animInst)
+            -- preload (LoadAnimation кэширует/возвращает трек)
             pcall(function()
                 humanoid:LoadAnimation(animInst)
             end)
@@ -191,6 +185,7 @@ local function AttachAnimateToCharacter(char, storage)
         if not list or #list == 0 then return end
         local idx = rollAnimation(animNames[animName]) or 1
         local animObj = list[idx] or list[1]
+        -- если тот же animation instance — не перегружаем
         if storage.currentTrack then
             pcall(function()
                 storage.currentTrack:Stop(transition)
@@ -205,6 +200,7 @@ local function AttachAnimateToCharacter(char, storage)
             track:Play(transition)
             storage.currentAnim = animName
         end
+        -- если walk — стартим run-layer
         if animName == "walk" then
             local runList = storage.animTable["run"]
             if runList and #runList > 0 then
@@ -220,7 +216,9 @@ local function AttachAnimateToCharacter(char, storage)
         end
     end
 
+    -- сеттер скорости: упрощённо подменяем веса/скорости для walk/run
     local function setRunSpeed(speed)
+        -- scale approx: base 16
         local base = 16
         local s = speed / base
         if storage.currentTrack then
@@ -231,6 +229,7 @@ local function AttachAnimateToCharacter(char, storage)
         end
     end
 
+    -- обработчики состояний
     local function onStateChanged(old, new)
         if new == Enum.HumanoidStateType.Jumping then
             play("jump", 0.1)
@@ -248,6 +247,7 @@ local function AttachAnimateToCharacter(char, storage)
             play("walk", 0.2)
             setRunSpeed(speed)
         else
+            -- если не в свободном падении и не эмоте — возрврат к idle
             if storage.currentAnim ~= "idle" then
                 play("idle", 0.2)
             end
@@ -268,14 +268,18 @@ local function AttachAnimateToCharacter(char, storage)
         end
     end
 
+    -- подписываемся на события humanoid и сохраняем ссылки в storage.connections
     table.insert(storage.connections, humanoid.StateChanged:Connect(onStateChanged))
     table.insert(storage.connections, humanoid.Running:Connect(onRunning))
     table.insert(storage.connections, humanoid.Climbing:Connect(onClimbing))
     table.insert(storage.connections, humanoid.Swimming:Connect(onSwimming))
 
+    -- инициализация: стартуем idle
     play("idle", 0.1)
 
+    -- сохраняем функцию остановки для внешней очистки
     storage._stopAll = function()
+        -- остановим треки
         if storage.currentTrack then
             pcall(function() storage.currentTrack:Stop() storage.currentTrack:Destroy() end)
             storage.currentTrack = nil
@@ -284,6 +288,7 @@ local function AttachAnimateToCharacter(char, storage)
             pcall(function() storage.runTrack:Stop() storage.runTrack:Destroy() end)
             storage.runTrack = nil
         end
+        -- отключим подписки
         if storage.connections then
             for _,c in ipairs(storage.connections) do
                 pcall(function() c:Disconnect() end)
@@ -307,53 +312,9 @@ local function CleanupAnimateStorage(storage)
     storage.connections = nil
 end
 
--- ======== Anti-Fling ========
-local function startAntiFling()
-    if antiFlingEnabled then return end
-    antiFlingEnabled = true
-    affectedParts = {}
+-- ========== ОКОНЧАНИЕ АНИМАЦИОННОЙ СИСТЕМЫ ==========
 
-    antiFlingConn = RunService.Heartbeat:Connect(function()
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj:IsA("BasePart") and obj.Name == "HumanoidRootPart" and obj.Parent and obj.Parent ~= player.Character then
-                affectedParts[obj] = true
-                pcall(function()
-                    obj.CustomPhysicalProperties = PhysicalProperties.new(0,0,0,0,0)
-                    obj.Velocity = Vector3.new(0,0,0)
-                    obj.RotVelocity = Vector3.new(0,0,0)
-                    obj.CanCollide = false
-                end)
-            end
-        end
-    end)
-
-    antiFlingDescAddedConn = workspace.DescendantAdded:Connect(function(obj)
-        if obj:IsA("BasePart") and obj.Name == "HumanoidRootPart" and obj.Parent and obj.Parent ~= player.Character then
-            affectedParts[obj] = true
-            pcall(function()
-                obj.CustomPhysicalProperties = PhysicalProperties.new(0,0,0,0,0)
-                obj.Velocity = Vector3.new(0,0,0)
-                obj.RotVelocity = Vector3.new(0,0,0)
-                obj.CanCollide = false
-            end)
-        end
-    end)
-end
-
-local function stopAntiFling()
-    if antiFlingConn then
-        antiFlingConn:Disconnect()
-        antiFlingConn = nil
-    end
-    if antiFlingDescAddedConn then
-        antiFlingDescAddedConn:Disconnect()
-        antiFlingDescAddedConn = nil
-    end
-    affectedParts = {}
-    antiFlingEnabled = false
-end
-
--- ======== Управление клоном / safe-teleport ========
+-- Удаление клона
 local function cleanupFake()
     if fakeDiedConn then
         fakeDiedConn:Disconnect()
@@ -364,29 +325,32 @@ local function cleanupFake()
         renderConn = nil
     end
     if FakeCharacter then
+        -- очистим анимации, если прикручивали
         CleanupAnimateStorage(FakeAnimData)
         FakeCharacter:Destroy()
         FakeCharacter = nil
     end
 end
 
+-- Создание клона
 local function CreateClone()
     updateCharacter()
-    if not RealCharacter or not RealCharacter:FindFirstChild("HumanoidRootPart") then return end
+    if not RealCharacter:FindFirstChild("HumanoidRootPart") then return end
 
     cleanupFake()
 
     RealCharacter.Archivable = true
     FakeCharacter = RealCharacter:Clone()
 
+    -- убираем лишнее у клона (физические силы и т.п.)
     for _, v in ipairs(FakeCharacter:GetDescendants()) do
-        if v:IsA("BodyVelocity") or v:IsA("BodyGyro") or v:IsA("BodyPosition") or v:IsA("VectorForce") then
+        if v:IsA("BodyVelocity") or v:IsA("BodyGyro") or v:IsA("BodyPosition") then
             v:Destroy()
         end
     end
 
     FakeCharacter.Parent = workspace
-
+    -- синхронно поставить в то же место
     local realHRP = RealCharacter:FindFirstChild("HumanoidRootPart")
     local fakeHRP = FakeCharacter:FindFirstChild("HumanoidRootPart")
     if realHRP and fakeHRP then
@@ -396,52 +360,49 @@ local function CreateClone()
         fakeHRP.Anchored = false
     end
 
-    -- Делаем фантом полупрозрачным с эффектами
+    -- Подменяю прозрачность у частей клона (чтобы был полупрозрачный фантом)
     for _, v in ipairs(FakeCharacter:GetDescendants()) do
         if v:IsA("BasePart") then
             v.Transparency = 0.85
-            v.Material = Enum.Material.Glass
-            v.Color = Color3.fromRGB(170, 170, 255)
-            pcall(function() v.CanCollide = false end)
+        elseif v:IsA("Decal") or v:IsA("Texture") then
+            -- по желанию оставить видимые детали; можно менять
+            -- оставим как есть
         end
     end
 
+    -- Камера на фантом
     workspace.CurrentCamera.CameraSubject = findHumanoid(FakeCharacter)
 
-    -- Перемещаем оригинал
+    -- Перемещаем оригинал далеко (чтобы не мешал)
     if realHRP then
-        RealCharacter:SetPrimaryPartCFrame(CFrame.new(0, 1e4, 0))
+        RealCharacter.HumanoidRootPart.CFrame = RealCharacter.HumanoidRootPart.CFrame + Vector3.new(0, 1e5, 0)
     end
 
-    -- Синхронизируем движения
+    -- Синхронизация движения фантома с оригиналом (копируем направление и прыжки)
     renderConn = RunService.RenderStepped:Connect(function()
         if not IsInvisible or not FakeCharacter then return end
         workspace.CurrentCamera.CameraSubject = findHumanoid(FakeCharacter)
         local realHum = findHumanoid(RealCharacter)
         local fakeHum = findHumanoid(FakeCharacter)
         if realHum and fakeHum then
+            -- MoveDirection нельзя напрямую присвоить, используем Move()
             pcall(function()
                 fakeHum:Move(realHum.MoveDirection)
                 fakeHum.Jump = realHum.Jump
             end)
         end
-
-        -- Обновляем lastSafeCFrame
-        if fakeHRP and fakeHRP.Parent and fakeHRP.Position and fakeHRP.Position.Y and fakeHRP.Position.Y > safeYThreshold then
-            lastSafeCFrame = fakeHRP.CFrame
-        end
     end)
 
-    -- Анимируем фантом
+    -- Прикручиваем анимационную систему к клону (локально)
     FakeAnimData = { connections = {}, tracks = {}, current = nil }
     AttachAnimateToCharacter(FakeCharacter, FakeAnimData)
 
-    -- При смерти фантома
+    -- Смерть клона: пересоздаём (как в оригинале)
     local fakeHum = findHumanoid(FakeCharacter)
     if fakeHum then
         fakeDiedConn = fakeHum.Died:Connect(function()
             if IsInvisible then
-                task.wait(0.12)
+                task.wait(0.1)
                 cleanupFake()
                 if IsInvisible then
                     CreateClone()
@@ -451,6 +412,7 @@ local function CreateClone()
     end
 end
 
+-- Возврат персонажа
 local function TeleportAndRemoveClone()
     if not IsInvisible then return end
     IsInvisible = false
@@ -460,56 +422,15 @@ local function TeleportAndRemoveClone()
         renderConn = nil
     end
 
-    -- Безопасный телепорт с защитой от пустоты
-    local fakeHRP = FakeCharacter and FakeCharacter:FindFirstChild("HumanoidRootPart")
-    local safeCFrameToUse = nil
-
-    if fakeHRP then
-        local fy = fakeHRP.Position.Y
-        if fy and fy > safeYThreshold then
-            safeCFrameToUse = fakeHRP.CFrame + Vector3.new(0, 3, 0)
-        elseif lastSafeCFrame then
-            safeCFrameToUse = lastSafeCFrame + Vector3.new(0, 3, 0)
-        else
-            if player.RespawnLocation and player.RespawnLocation:IsA("BasePart") then
-                safeCFrameToUse = player.RespawnLocation.CFrame + Vector3.new(0, 3, 0)
-            else
-                local spawn = workspace:FindFirstChildOfClass("SpawnLocation")
-                if spawn then
-                    safeCFrameToUse = spawn.CFrame + Vector3.new(0, 3, 0)
-                else
-                    safeCFrameToUse = workspace.CurrentCamera.CFrame
-                end
-            end
-        end
-    elseif lastSafeCFrame then
-        safeCFrameToUse = lastSafeCFrame + Vector3.new(0, 3, 0)
-    else
-        if player.RespawnLocation and player.RespawnLocation:IsA("BasePart") then
-            safeCFrameToUse = player.RespawnLocation.CFrame + Vector3.new(0, 3, 0)
-        else
-            local spawn = workspace:FindFirstChildOfClass("SpawnLocation")
-            if spawn then
-                safeCFrameToUse = spawn.CFrame + Vector3.new(0, 3, 0)
-            else
-                safeCFrameToUse = workspace.CurrentCamera.CFrame
-            end
-        end
-    end
-
-    -- Телепорт реального персонажа
-    if RealCharacter and RealCharacter:FindFirstChild("HumanoidRootPart") and safeCFrameToUse then
-        pcall(function()
-            RealCharacter:SetPrimaryPartCFrame(safeCFrameToUse)
-        end)
+    if FakeCharacter and FakeCharacter:FindFirstChild("HumanoidRootPart") and RealCharacter and RealCharacter:FindFirstChild("HumanoidRootPart") then
+        RealCharacter.HumanoidRootPart.CFrame = FakeCharacter.HumanoidRootPart.CFrame
     end
 
     cleanupFake()
     workspace.CurrentCamera.CameraSubject = findHumanoid(RealCharacter)
-    stopAntiFling()
 end
 
--- Следим за смертью реального персонажа
+-- Слежение за смертью персонажа
 local function watchDeathForReal()
     if realDiedConn then
         realDiedConn:Disconnect()
@@ -525,7 +446,7 @@ local function watchDeathForReal()
     end
 end
 
--- ======== УЛУЧШЕННЫЙ GUI ========
+-- UI
 local function createGui()
     local gui = player:WaitForChild("PlayerGui")
     local existing = gui:FindFirstChild("InvisibilityCloakGUI")
@@ -539,134 +460,50 @@ local function createGui()
     local uiScale = Instance.new("UIScale", screen)
     uiScale.Scale = UserInputService.TouchEnabled and 1.2 or 1
 
-    local container = Instance.new("Frame")
-    container.Name = "MainContainer"
-    container.Size = UDim2.new(0.25, 0, 0.09, 0)
-    container.AnchorPoint = Vector2.new(1, 1)
-    container.Position = savedPos and UDim2.new(savedPos.X.Scale, savedPos.X.Offset, savedPos.Y.Scale, savedPos.Y.Offset) or UDim2.new(0.98, 0, 0.95, 0)
-    container.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
-    container.BackgroundTransparency = 0.2
-    container.Parent = screen
-    
-    local corner = Instance.new("UICorner", container)
-    corner.CornerRadius = UDim.new(0, 12)
-    
-    local stroke = Instance.new("UIStroke", container)
-    stroke.Thickness = 2
-    stroke.Color = Color3.fromRGB(80, 100, 180)
-    stroke.Transparency = 0.3
-
-    -- Эффект свечения
-    local glow = Instance.new("ImageLabel")
-    glow.Name = "GlowEffect"
-    glow.Size = UDim2.new(1.1, 0, 1.1, 0)
-    glow.Position = UDim2.new(-0.05, 0, -0.05, 0)
-    glow.BackgroundTransparency = 1
-    glow.Image = "rbxassetid://8992231221" -- ID текстуры свечения
-    glow.ImageColor3 = Color3.fromRGB(60, 90, 160)
-    glow.ScaleType = Enum.ScaleType.Slice
-    glow.SliceCenter = Rect.new(100, 100, 100, 100)
-    glow.Parent = container
-
-    -- Основная кнопка
     local button = Instance.new("TextButton")
     button.Name = "ToggleButton"
-    button.Size = UDim2.new(1, 0, 1, 0)
-    button.BackgroundTransparency = 1
-    button.Text = ""
-    button.ZIndex = 2
-    button.Parent = container
-
-    -- Контент
-    local content = Instance.new("Frame")
-    content.Name = "Content"
-    content.Size = UDim2.new(1, -20, 1, -10)
-    content.Position = UDim2.new(0, 10, 0, 5)
-    content.BackgroundTransparency = 1
-    content.Parent = container
-
-    -- Иконка состояния
-    local stateIcon = Instance.new("ImageLabel")
-    stateIcon.Name = "StateIcon"
-    stateIcon.Size = UDim2.new(0.15, 0, 0.8, 0)
-    stateIcon.Position = UDim2.new(0, 0, 0.1, 0)
-    stateIcon.BackgroundTransparency = 1
-    stateIcon.Image = "rbxassetid://3926305904" -- ID иконки глаза
-    stateIcon.ImageRectOffset = Vector2.new(124, 364)
-    stateIcon.ImageRectSize = Vector2.new(36, 36)
-    stateIcon.ImageColor3 = Color3.fromRGB(200, 200, 
-    stateIcon.Parent = content
-
-    -- Текст состояния
-    local stateText = Instance.new("TextLabel")
-    stateText.Name = "StateText"
-    stateText.Size = UDim2.new(0.7, 0, 0.8, 0)
-    stateText.Position = UDim2.new(0.17, 0, 0.1, 0)
-    stateText.BackgroundTransparency = 1
-    stateText.Font = Enum.Font.GothamBold
-    stateText.Text = "INVISIBLE: OFF"
-    stateText.TextColor3 = Color3.fromRGB(200, 220, 255)
-    stateText.TextSize = 18
-    stateText.TextXAlignment = Enum.TextXAlignment.Left
-    stateText.Parent = content
-
-    -- Подпись создателя
+    button.Size = UDim2.new(0.22, 0, 0.08, 0)
+    button.AnchorPoint = Vector2.new(1, 1)
+    button.Position = savedPos and UDim2.new(savedPos.X.Scale, savedPos.X.Offset, savedPos.Y.Scale, savedPos.Y.Offset) or UDim2.new(0.98, 0, 0.95, 0)
+    button.Text = "Invisible enable"
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 20
+    button.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    button.TextColor3 = Color3.fromRGB(255,255,255)
+    button.Parent = screen
+    Instance.new("UICorner", button).CornerRadius = UDim.new(0, 10)
+    local btnStroke = Instance.new("UIStroke", button)
+    btnStroke.Thickness = 2
+    btnStroke.Color = Color3.fromRGB(100, 100, 140)
     local signature = Instance.new("TextLabel")
-    signature.Name = "Signature"
-    signature.Size = UDim2.new(1, 0, 0.3, 0)
-    signature.Position = UDim2.new(0, 0, 0.7, 0)
+    signature.Size = UDim2.new(1, 0, 0.4, 0)
+    signature.Position = UDim2.new(0, 0, 0.65, 0)
     signature.BackgroundTransparency = 1
     signature.Font = Enum.Font.Gotham
     signature.TextSize = 12
-    signature.TextColor3 = Color3.fromRGB(160, 180, 220)
+    signature.TextColor3 = Color3.fromRGB(180,180,180)
     signature.Text = "by BrizNexuc"
-    signature.TextXAlignment = Enum.TextXAlignment.Right
-    signature.Parent = content
-
-    -- Эффект при наведении
-    button.MouseEnter:Connect(function()
-        TweenService:Create(container, TweenInfo.new(0.2), {
-            BackgroundTransparency = 0.1,
-            Size = UDim2.new(0.26, 0, 0.095, 0)
-        }):Play()
-        TweenService:Create(stroke, TweenInfo.new(0.2), {
-            Thickness = 3,
-            Transparency = 0
-        }):Play()
-    end)
-
-    button.MouseLeave:Connect(function()
-        TweenService:Create(container, TweenInfo.new(0.3), {
-            BackgroundTransparency = 0.2,
-            Size = UDim2.new(0.25, 0, 0.09, 0)
-        }):Play()
-        TweenService:Create(stroke, TweenInfo.new(0.3), {
-            Thickness = 2,
-            Transparency = 0.3
-        }):Play()
-    end)
+    signature.Parent = button
 
     -- Перетаскивание с сохранением
     local dragging, dragStart, startPos
     local function update(input)
         local delta = input.Position - dragStart
-        container.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        button.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
     end
-    
     button.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
             dragStart = input.Position
-            startPos = container.Position
+            startPos = button.Position
             input.Changed:Connect(function()
                 if input.UserInputState == Enum.UserInputState.End then
                     dragging = false
-                    -- Сохраняем позицию
                     pcall(function()
                         if writefile then
                             writefile(savedPosFile, HttpService:JSONEncode({
-                                X = {Scale = container.Position.X.Scale, Offset = container.Position.X.Offset},
-                                Y = {Scale = container.Position.Y.Scale, Offset = container.Position.Y.Offset}
+                                X = {Scale = button.Position.X.Scale, Offset = button.Position.X.Offset},
+                                Y = {Scale = button.Position.Y.Scale, Offset = button.Position.Y.Offset}
                             }))
                         end
                     end)
@@ -674,19 +511,16 @@ local function createGui()
             end)
         end
     end)
-    
     button.InputChanged:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            if dragging then
-                update(input)
-            end
+            if dragging then update(input) end
         end
     end)
 
-    return button, stateIcon, stateText
+    return button
 end
 
-local button, stateIcon, stateText = createGui()
+local button = createGui()
 
 -- Переключение режима
 local function ToggleInvisibility()
@@ -694,55 +528,20 @@ local function ToggleInvisibility()
         IsInvisible = true
         CreateClone()
         watchDeathForReal()
-        startAntiFling() -- Включаем защиту от флинга
-
-        -- Обновление UI
-        stateText.Text = "INVISIBLE: ON"
-        stateIcon.ImageRectOffset = Vector2.new(844, 884) -- Иконка перечеркнутого глаза
-        
-        TweenService:Create(stateIcon, TweenInfo.new(0.3), {
-            ImageColor3 = Color3.fromRGB(100, 200, 255)
-        }):Play()
-        
-        TweenService:Create(stateText, TweenInfo.new(0.3), {
-            TextColor3 = Color3.fromRGB(100, 200, 255)
-        }):Play()
-
-        -- Звуковой эффект
+        button.Text = "Invisible disable"
         local sound = Instance.new("Sound")
-        sound.SoundId = "rbxassetid://232127604" -- Звук активации
+        sound.SoundId = "rbxassetid://232127604"
         sound.Parent = SoundService
         sound:Play()
         game.Debris:AddItem(sound, 3)
-
-        StarterGui:SetCore("SendNotification", {
-            Title = "🕶 INVISIBILITY CLOAK",
-            Text = "Mode enabled | by BrizNexuc",
-            Duration = 4,
-            Icon = "rbxassetid://3926305904"
-        })
+        TweenService:Create(button, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(55,75,110)}):Play()
+        StarterGui:SetCore("SendNotification", { Title = "Invisible Cloak", Text = "Mode enabled", Duration = 4 })
     else
         TeleportAndRemoveClone()
         IsInvisible = false
-        
-        -- Обновление UI
-        stateText.Text = "INVISIBLE: OFF"
-        stateIcon.ImageRectOffset = Vector2.new(124, 364) -- Иконка глаза
-        
-        TweenService:Create(stateIcon, TweenInfo.new(0.3), {
-            ImageColor3 = Color3.fromRGB(200, 200, 255)
-        }):Play()
-        
-        TweenService:Create(stateText, TweenInfo.new(0.3), {
-            TextColor3 = Color3.fromRGB(200, 220, 255)
-        }):Play()
-
-        StarterGui:SetCore("SendNotification", {
-            Title = "🕶 INVISIBILITY CLOAK",
-            Text = "Mode disabled | by BrizNexuc",
-            Duration = 3,
-            Icon = "rbxassetid://3926305904"
-        })
+        button.Text = "Invisible enable"
+        TweenService:Create(button, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(35,35,40)}):Play()
+        StarterGui:SetCore("SendNotification", { Title = "Invisible Cloak", Text = "Mode disabled", Duration = 3 })
     end
 end
 
@@ -750,9 +549,7 @@ button.MouseButton1Click:Connect(ToggleInvisibility)
 
 charAddedConn = player.CharacterAdded:Connect(function(char)
     RealCharacter = char
-    if IsInvisible then
-        TeleportAndRemoveClone()
-    end
+    if IsInvisible then TeleportAndRemoveClone() end
     watchDeathForReal()
 end)
 
