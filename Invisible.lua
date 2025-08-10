@@ -1,5 +1,5 @@
--- LocalScript: Invisibility Cloak GUI (строгий стиль, динамичный текст, сохранение позиции)
--- Поместить в StarterPlayerScripts или StarterGui
+-- Invisibility Cloak v4 by BrizNexuc + ChatGPT
+-- Кладём в StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,177 +12,180 @@ local HttpService = game:GetService("HttpService")
 local player = Players.LocalPlayer
 local IsInvisible = false
 local RealCharacter = player.Character or player.CharacterAdded:Wait()
-local FakeCharacter = nil
+local FakeCharacter
 
--- Соединения
-local renderConn, realDiedConn, fakeDiedConn, charAddedConn = nil, nil, nil, nil
+local renderConn, realDiedConn, fakeDiedConn
 
--- Хранилище позиции кнопки (локально)
-local savedPosFile = "buttonPos_" .. player.UserId .. ".json"
-local savedPos = nil
+-- Файл позиции кнопки
+local savedPosFile = "cloakBtnPos_" .. player.UserId .. ".json"
+local savedPos
 pcall(function()
 	if isfile and isfile(savedPosFile) then
 		savedPos = HttpService:JSONDecode(readfile(savedPosFile))
 	end
 end)
 
--- Поиск Humanoid
-local function findHumanoid(char)
-	if not char then return nil end
-	return char:FindFirstChildOfClass("Humanoid")
+-- Функция поиска Humanoid
+local function getHumanoid(char)
+	if char then
+		return char:FindFirstChildOfClass("Humanoid")
+	end
 end
 
--- Обновление ссылки на персонажа
-local function updateCharacter()
-	RealCharacter = player.Character or player.CharacterAdded:Wait()
-end
-
--- Удаление клона
+-- Очистка фантома
 local function cleanupFake()
 	if fakeDiedConn then fakeDiedConn:Disconnect() fakeDiedConn = nil end
-	if FakeCharacter then FakeCharacter:Destroy() FakeCharacter = nil end
 	if renderConn then renderConn:Disconnect() renderConn = nil end
+	if FakeCharacter then FakeCharacter:Destroy() FakeCharacter = nil end
 end
 
--- Создание клона
-local function CreateClone()
-	updateCharacter()
-	if not RealCharacter:FindFirstChild("HumanoidRootPart") then return end
-
-	cleanupFake()
+-- Создание фантома
+local function createClone()
 	RealCharacter.Archivable = true
 	FakeCharacter = RealCharacter:Clone()
 
-	-- Убираем лишнее
+	-- Удаляем физические объекты
 	for _, v in ipairs(FakeCharacter:GetDescendants()) do
 		if v:IsA("BodyVelocity") or v:IsA("BodyGyro") or v:IsA("BodyPosition") then
 			v:Destroy()
 		end
 	end
 
-	FakeCharacter.Parent = workspace
-	FakeCharacter.HumanoidRootPart.CFrame = RealCharacter.HumanoidRootPart.CFrame
-	FakeCharacter.HumanoidRootPart.Anchored = false
-
-	-- Прозрачность
+	-- Прозрачность фантома
 	for _, v in ipairs(FakeCharacter:GetDescendants()) do
-		if v:IsA("BasePart") then v.Transparency = 0.85 end
+		if v:IsA("BasePart") then
+			v.Transparency = 0
+		end
 	end
 
-	-- Камера
-	workspace.CurrentCamera.CameraSubject = findHumanoid(FakeCharacter)
+	FakeCharacter.Parent = workspace
+	FakeCharacter:SetPrimaryPartCFrame(RealCharacter.PrimaryPart.CFrame)
 
-	-- Перемещаем оригинал
-	RealCharacter.HumanoidRootPart.CFrame += Vector3.new(0, 1e5, 0)
+	-- Делаем настоящее тело невидимым
+	for _, v in ipairs(RealCharacter:GetDescendants()) do
+		if v:IsA("BasePart") then
+			v.LocalTransparencyModifier = 1
+			v.Transparency = 1
+		elseif v:IsA("Decal") then
+			v.Transparency = 1
+		end
+	end
 
-	-- Синхронизация
+	-- Переключаем камеру на фантома
+	workspace.CurrentCamera.CameraSubject = getHumanoid(FakeCharacter)
+
+	-- Синхронизация движений и анимаций
 	renderConn = RunService.RenderStepped:Connect(function()
 		if not IsInvisible or not FakeCharacter then return end
-		workspace.CurrentCamera.CameraSubject = findHumanoid(FakeCharacter)
-		local realHum = findHumanoid(RealCharacter)
-		local fakeHum = findHumanoid(FakeCharacter)
+		local realHum = getHumanoid(RealCharacter)
+		local fakeHum = getHumanoid(FakeCharacter)
 		if realHum and fakeHum then
 			fakeHum:Move(realHum.MoveDirection)
 			fakeHum.Jump = realHum.Jump
+
+			-- Копирование анимаций
+			local realAnim = realHum:FindFirstChildOfClass("Animator")
+			local fakeAnim = fakeHum:FindFirstChildOfClass("Animator")
+			if realAnim and fakeAnim then
+				for _, track in ipairs(fakeAnim:GetPlayingAnimationTracks()) do
+					track:Stop()
+				end
+				for _, track in ipairs(realAnim:GetPlayingAnimationTracks()) do
+					local newTrack = fakeAnim:LoadAnimation(track.Animation)
+					newTrack.TimePosition = track.TimePosition
+					newTrack:Play()
+					newTrack.Speed = track.Speed
+				end
+			end
 		end
 	end)
 
-	-- Смерть клона
-	fakeDiedConn = findHumanoid(FakeCharacter).Died:Connect(function()
+	-- Пересоздаём фантом, если умер
+	fakeDiedConn = getHumanoid(FakeCharacter).Died:Connect(function()
 		if IsInvisible then
-			task.wait(0.1)
 			cleanupFake()
-			if IsInvisible then CreateClone() end
+			createClone()
 		end
 	end)
 end
 
--- Возврат персонажа
-local function TeleportAndRemoveClone()
-	if not IsInvisible then return end
+-- Отключение невидимости
+local function disableInvisibility()
 	IsInvisible = false
-	if renderConn then renderConn:Disconnect() renderConn = nil end
-
-	if FakeCharacter and FakeCharacter:FindFirstChild("HumanoidRootPart") then
-		RealCharacter.HumanoidRootPart.CFrame = FakeCharacter.HumanoidRootPart.CFrame
-	end
-
 	cleanupFake()
-	workspace.CurrentCamera.CameraSubject = findHumanoid(RealCharacter)
-end
 
--- Слежение за смертью персонажа
-local function watchDeathForReal()
-	if realDiedConn then realDiedConn:Disconnect() realDiedConn = nil end
-	local realHum = findHumanoid(RealCharacter)
-	if realHum then
-		realDiedConn = realHum.Died:Connect(function()
-			if IsInvisible then TeleportAndRemoveClone() end
-		end)
+	-- Возвращаем видимость
+	for _, v in ipairs(RealCharacter:GetDescendants()) do
+		if v:IsA("BasePart") then
+			v.LocalTransparencyModifier = 0
+			v.Transparency = 0
+		elseif v:IsA("Decal") then
+			v.Transparency = 0
+		end
 	end
+
+	workspace.CurrentCamera.CameraSubject = getHumanoid(RealCharacter)
 end
 
 -- UI
 local function createGui()
 	local gui = player:WaitForChild("PlayerGui")
-	local existing = gui:FindFirstChild("InvisibilityCloakGUI")
-	if existing then existing:Destroy() end
+	local old = gui:FindFirstChild("InvisibilityCloakGUI")
+	if old then old:Destroy() end
 
 	local screen = Instance.new("ScreenGui")
 	screen.Name = "InvisibilityCloakGUI"
 	screen.ResetOnSpawn = false
 	screen.Parent = gui
 
-	local uiScale = Instance.new("UIScale", screen)
-	uiScale.Scale = UserInputService.TouchEnabled and 1.2 or 1
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(0.26, 0, 0.1, 0)
+	btn.AnchorPoint = Vector2.new(1, 1)
+	btn.Position = savedPos and UDim2.new(savedPos.X.Scale, savedPos.X.Offset, savedPos.Y.Scale, savedPos.Y.Offset) or UDim2.new(0.98, 0, 0.95, 0)
+	btn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+	btn.Text = ""
+	btn.Parent = screen
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 12)
 
-	local button = Instance.new("TextButton")
-	button.Name = "ToggleButton"
-	button.Size = UDim2.new(0.22, 0, 0.08, 0)
-	button.AnchorPoint = Vector2.new(1, 1)
-	button.Position = savedPos and UDim2.new(savedPos.X.Scale, savedPos.X.Offset, savedPos.Y.Scale, savedPos.Y.Offset) or UDim2.new(0.98, 0, 0.95, 0)
-	button.Text = "Invisible enable"
-	button.Font = Enum.Font.GothamBold
-	button.TextSize = 20
-	button.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-	button.TextColor3 = Color3.fromRGB(255,255,255)
-	button.Parent = screen
-	Instance.new("UICorner", button).CornerRadius = UDim.new(0, 10)
+	local grad = Instance.new("UIGradient", btn)
+	grad.Color = ColorSequence.new(Color3.fromRGB(45, 45, 55), Color3.fromRGB(25, 25, 30))
 
-	local btnStroke = Instance.new("UIStroke", button)
-	btnStroke.Thickness = 2
-	btnStroke.Color = Color3.fromRGB(100, 100, 140)
+	local stroke = Instance.new("UIStroke", btn)
+	stroke.Thickness = 2
+	stroke.Color = Color3.fromRGB(100, 100, 140)
 
-	local signature = Instance.new("TextLabel")
-	signature.Size = UDim2.new(1, 0, 0.4, 0)
-	signature.Position = UDim2.new(0, 0, 0.65, 0)
-	signature.BackgroundTransparency = 1
-	signature.Font = Enum.Font.Gotham
-	signature.TextSize = 12
-	signature.TextColor3 = Color3.fromRGB(180,180,180)
-	signature.Text = "by BrizNexuc"
-	signature.Parent = button
+	local status = Instance.new("TextLabel", btn)
+	status.Size = UDim2.new(1, 0, 0.5, 0)
+	status.BackgroundTransparency = 1
+	status.Font = Enum.Font.GothamBold
+	status.TextSize = 20
+	status.Text = "Status: OFF"
+	status.TextColor3 = Color3.fromRGB(200, 70, 70)
 
-	-- Перетаскивание с сохранением
+	local author = Instance.new("TextLabel", btn)
+	author.Size = UDim2.new(1, 0, 0.4, 0)
+	author.Position = UDim2.new(0, 0, 0.6, 0)
+	author.BackgroundTransparency = 1
+	author.Font = Enum.Font.Gotham
+	author.TextSize = 14
+	author.TextColor3 = Color3.fromRGB(180, 180, 220)
+	author.Text = "by BrizNexuc"
+
+	-- Перетаскивание
 	local dragging, dragStart, startPos
-	local function update(input)
-		local delta = input.Position - dragStart
-		button.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-	end
-	button.InputBegan:Connect(function(input)
+	btn.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
 			dragStart = input.Position
-			startPos = button.Position
+			startPos = btn.Position
 			input.Changed:Connect(function()
 				if input.UserInputState == Enum.UserInputState.End then
 					dragging = false
-					-- сохраняем позицию
 					pcall(function()
 						if writefile then
 							writefile(savedPosFile, HttpService:JSONEncode({
-								X = {Scale = button.Position.X.Scale, Offset = button.Position.X.Offset},
-								Y = {Scale = button.Position.Y.Scale, Offset = button.Position.Y.Offset}
+								X = {Scale = btn.Position.X.Scale, Offset = btn.Position.X.Offset},
+								Y = {Scale = btn.Position.Y.Scale, Offset = btn.Position.Y.Offset}
 							}))
 						end
 					end)
@@ -190,47 +193,44 @@ local function createGui()
 			end)
 		end
 	end)
-	button.InputChanged:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-			if dragging then
-				update(input)
-			end
+	btn.InputChanged:Connect(function(input)
+		if (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) and dragging then
+			local delta = input.Position - dragStart
+			btn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
 		end
 	end)
 
-	return button
+	return btn, status
 end
 
-local button = createGui()
+local button, statusLabel = createGui()
 
--- Переключение режима
-local function ToggleInvisibility()
+-- Переключатель
+local function toggleInvisibility()
 	if not IsInvisible then
 		IsInvisible = true
-		CreateClone()
-		watchDeathForReal()
+		createClone()
+		statusLabel.Text = "Status: ON"
+		statusLabel.TextColor3 = Color3.fromRGB(70, 200, 70)
 
-		button.Text = "Invisible disable"
-
-		local sound = Instance.new("Sound")
+		local sound = Instance.new("Sound", SoundService)
 		sound.SoundId = "rbxassetid://232127604"
-		sound.Parent = SoundService
 		sound:Play()
 		game.Debris:AddItem(sound, 3)
 
-		TweenService:Create(button, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(55,75,110)}):Play()
+		TweenService:Create(button, TweenInfo.new(0.3), {BackgroundColor3 = Color3.fromRGB(55, 75, 110)}):Play()
 
 		StarterGui:SetCore("SendNotification", {
 			Title = "Invisible Cloak",
 			Text = "Mode enabled",
-			Duration = 4
+			Duration = 3
 		})
 	else
-		TeleportAndRemoveClone()
-		IsInvisible = false
-		button.Text = "Invisible enable"
+		disableInvisibility()
+		statusLabel.Text = "Status: OFF"
+		statusLabel.TextColor3 = Color3.fromRGB(200, 70, 70)
 
-		TweenService:Create(button, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(35,35,40)}):Play()
+		TweenService:Create(button, TweenInfo.new(0.3), {BackgroundColor3 = Color3.fromRGB(35, 35, 40)}):Play()
 
 		StarterGui:SetCore("SendNotification", {
 			Title = "Invisible Cloak",
@@ -240,14 +240,12 @@ local function ToggleInvisibility()
 	end
 end
 
-button.MouseButton1Click:Connect(ToggleInvisibility)
+button.MouseButton1Click:Connect(toggleInvisibility)
 
-charAddedConn = player.CharacterAdded:Connect(function(char)
+-- Перезапуск при респавне
+player.CharacterAdded:Connect(function(char)
 	RealCharacter = char
 	if IsInvisible then
-		TeleportAndRemoveClone()
+		disableInvisibility()
 	end
-	watchDeathForReal()
 end)
-
-watchDeathForReal()
